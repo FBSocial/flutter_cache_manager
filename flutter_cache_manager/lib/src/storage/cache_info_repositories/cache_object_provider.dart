@@ -6,14 +6,43 @@ import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import '../cache_object.dart';
 import 'cache_info_repository.dart';
+import 'dart:isolate';
 
 const _tableCacheObject = 'cacheObject';
+
+enum InsertType {
+    insert,
+    update
+}
+
+class InsertTaskModel {
+  //通知结果的port
+  SendPort? port;
+
+  //表名
+  String tableName = _tableCacheObject;
+
+  Map<String, dynamic> map = {};
+
+  String columnId = "";
+
+  int? id;
+
+  InsertType type = InsertType.insert;
+
+}
 
 class CacheObjectProvider extends CacheInfoRepository
     with CacheInfoRepositoryHelperMethods {
   Database? db;
   String? _path;
   String? databaseName;
+
+  ReceivePort writeReceivePort = ReceivePort();
+
+  List<InsertTaskModel> taskPool = [];
+
+  bool sqlLock = false;
 
   /// Either the path or the database name should be provided.
   /// If the path is provider it should end with '{databaseName}.db',
@@ -98,12 +127,57 @@ class CacheObjectProvider extends CacheInfoRepository
   @override
   Future<CacheObject> insert(CacheObject cacheObject,
       {bool setTouchedToNow = true}) async {
-    var id = await db!.insert(
-      _tableCacheObject,
-      cacheObject.toMap(setTouchedToNow: setTouchedToNow),
-    );
+    InsertTaskModel task = InsertTaskModel();
+    task.type = InsertType.insert;
+    task.tableName = _tableCacheObject;
+    task.map = cacheObject.toMap(setTouchedToNow: setTouchedToNow);
+    int id = await doTask(task);
     return cacheObject.copyWith(id: id);
   }
+
+  Future<int>doTask(InsertTaskModel task) async {
+    final ReceivePort receivePort = ReceivePort();
+    task.port = receivePort.sendPort;
+    taskPool.add(task);
+    runTaskLoop();
+    final res = await receivePort.first;
+    return res;
+  }
+
+  Future<void> runTaskLoop() async {
+    if (sqlLock) {
+      return;
+    }
+    if (taskPool.length > 0) {
+      InsertTaskModel task = taskPool.first;
+      try {
+        sqlLock = true;
+        if (task.type == InsertType.insert) {
+          var id = await db!.insert(
+            task.tableName,
+            task.map,
+          );
+          task.port?.send(id);
+        } else {
+          var id = db!.update(
+            task.tableName,
+            task.map,
+            where: '${CacheObject.columnId} = ?',
+            whereArgs: [task.id],
+          );
+          task.port?.send(id);
+        }
+      } catch (e) {
+        task.port?.send(0);
+      }
+      taskPool.removeAt(0);
+      sqlLock = false;
+      runTaskLoop();
+    } else {
+      sqlLock = false;
+    }
+  }
+
 
   @override
   Future<CacheObject?> get(String key) async {
@@ -129,12 +203,12 @@ class CacheObjectProvider extends CacheInfoRepository
 
   @override
   Future<int> update(CacheObject cacheObject, {bool setTouchedToNow = true}) {
-    return db!.update(
-      _tableCacheObject,
-      cacheObject.toMap(setTouchedToNow: setTouchedToNow),
-      where: '${CacheObject.columnId} = ?',
-      whereArgs: [cacheObject.id],
-    );
+    InsertTaskModel task = InsertTaskModel();
+    task.type = InsertType.update;
+    task.tableName = _tableCacheObject;
+    task.map = cacheObject.toMap(setTouchedToNow: setTouchedToNow);
+    task.id = cacheObject.id;
+    return doTask(task);
   }
 
   @override
