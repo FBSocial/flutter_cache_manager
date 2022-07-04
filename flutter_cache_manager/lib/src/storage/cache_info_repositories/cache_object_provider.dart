@@ -159,7 +159,7 @@ class CacheObjectProvider extends CacheInfoRepository
           );
           task.port?.send(id);
         } else {
-          var id = db!.update(
+          var id = await db!.update(
             task.tableName,
             task.map,
             where: '${CacheObject.columnId} = ?',
